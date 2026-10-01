@@ -22,10 +22,10 @@ jobs:
         run: python -m PyInstaller --noconfirm --clean --windowed --name KyZerAI app.py
       - name: Package
         shell: pwsh
-        run: Compress-Archive -Path dist/KyZerAI/* -DestinationPath KyZerAI-Windows.zip
+        run: Compress-Archive -Path dist/KyZerAI/* -DestinationPath KyZerAI-Windows-Lite.zip
       - name: Upload EXE package
         uses: actions/upload-artifact@v6
         with:
-          name: KyZerAI-Windows
-          path: KyZerAI-Windows.zip
+          name: KyZerAI-Windows-Lite
+          path: KyZerAI-Windows-Lite.zip
           retention-days: 30
