@@ -1,0 +1,31 @@
+name: Build KyZer AI Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+      - name: Build EXE
+        run: python -m PyInstaller --noconfirm --clean --windowed --name KyZerAI app.py
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dist/KyZerAI/* -DestinationPath KyZerAI-Windows.zip
+      - name: Upload EXE package
+        uses: actions/upload-artifact@v6
+        with:
+          name: KyZerAI-Windows
+          path: KyZerAI-Windows.zip
+          retention-days: 30
