@@ -3,6 +3,10 @@ import threading
 import time
 import urllib.request
 import json
+import logging
+import platform
+import sys
+import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -10,9 +14,52 @@ import numpy as np
 from PIL import Image, ImageTk
 
 MODEL_ID = "IlyasMoutawwakil/tiny-stable-diffusion-onnx"
-MODEL_DIR = os.path.join(os.path.expanduser("~"), ".kyzer_ai", "tiny_model")
+APP_DIR = os.path.join(os.path.expanduser("~"), ".kyzer_ai")
+MODEL_DIR = os.path.join(APP_DIR, "tiny_model")
+LOG_DIR = os.path.join(APP_DIR, "logs")
 OUT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "KyZer AI")
 HF_BASE = f"https://huggingface.co/{MODEL_ID}/resolve/main/"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_FILE = os.path.join(LOG_DIR, f"kyzer_ai_{time.strftime('%Y%m%d_%H%M%S')}.log")
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    encoding="utf-8",
+)
+logger = logging.getLogger("KyZerAI")
+
+
+def log_exception(context, exc=None):
+    if exc is not None:
+        logger.error("%s: %s", context, exc, exc_info=True)
+    else:
+        logger.error(context, exc_info=True)
+
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    if exc_type is KeyboardInterrupt:
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.critical(
+        "UNHANDLED APPLICATION EXCEPTION",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+
+
+sys.excepthook = global_exception_handler
+
+logger.info("KyZer AI started")
+logger.info("Log file: %s", LOG_FILE)
+logger.info("Python: %s", sys.version.replace("\\n", " "))
+logger.info("Platform: %s", platform.platform())
+logger.info("Executable: %s", sys.executable)
+logger.info("App directory: %s", APP_DIR)
+
 
 MODEL_FILES = [
     "model_index.json",
@@ -29,8 +76,6 @@ MODEL_FILES = [
     "vae_decoder/model.onnx",
 ]
 
-os.makedirs(OUT_DIR, exist_ok=True)
-
 
 def download_model(progress=None):
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -39,13 +84,16 @@ def download_model(progress=None):
         dst = os.path.join(MODEL_DIR, rel.replace("/", os.sep))
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.exists(dst) and os.path.getsize(dst) > 0:
+            logger.info("Model file already exists: %s (%d bytes)", rel, os.path.getsize(dst))
             if progress:
                 progress(i, total, f"Model files: {i}/{total}")
             continue
         url = HF_BASE + rel
         tmp = dst + ".part"
+        logger.info("Downloading model file: %s", url)
         urllib.request.urlretrieve(url, tmp)
         os.replace(tmp, dst)
+        logger.info("Downloaded: %s (%d bytes)", rel, os.path.getsize(dst))
         if progress:
             progress(i, total, f"Model files: {i}/{total}")
 
@@ -60,22 +108,45 @@ class TinyDiffusion:
         from transformers import CLIPTokenizer
 
         self.progress = progress
+        logger.info("Loading ONNX Runtime %s", ort.__version__)
+        logger.info("Available ONNX providers: %s", ort.get_available_providers())
         download_model(progress)
+
         self.ort = ort
         self.tokenizer = CLIPTokenizer.from_pretrained(os.path.join(MODEL_DIR, "tokenizer"))
-        self.text = ort.InferenceSession(
-            os.path.join(MODEL_DIR, "text_encoder", "model.onnx"),
-            providers=["CPUExecutionProvider"],
-        )
-        self.unet = ort.InferenceSession(
-            os.path.join(MODEL_DIR, "unet", "model.onnx"),
-            providers=["CPUExecutionProvider"],
-        )
-        self.vae = ort.InferenceSession(
-            os.path.join(MODEL_DIR, "vae_decoder", "model.onnx"),
-            providers=["CPUExecutionProvider"],
-        )
+
+        self.text = self._load_session("text_encoder/model.onnx", "text_encoder")
+        self.unet = self._load_session("unet/model.onnx", "unet")
+        self.vae = self._load_session("vae_decoder/model.onnx", "vae_decoder")
         self.scheduler = self._scheduler()
+
+    def _load_session(self, relative_path, name):
+        path = os.path.join(MODEL_DIR, relative_path.replace("/", os.sep))
+        logger.info("Loading %s ONNX model: %s", name, path)
+        session_options = self.ort.SessionOptions()
+        session_options.log_severity_level = 3
+        session = self.ort.InferenceSession(
+            path,
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
+        )
+        logger.info(
+            "%s inputs: %s",
+            name,
+            [
+                {"name": x.name, "type": x.type, "shape": x.shape}
+                for x in session.get_inputs()
+            ],
+        )
+        logger.info(
+            "%s outputs: %s",
+            name,
+            [
+                {"name": x.name, "type": x.type, "shape": x.shape}
+                for x in session.get_outputs()
+            ],
+        )
+        return session
 
     def _scheduler(self):
         with open(os.path.join(MODEL_DIR, "scheduler", "scheduler_config.json"), "r", encoding="utf-8") as f:
@@ -83,7 +154,6 @@ class TinyDiffusion:
         n = int(cfg.get("num_train_timesteps", 1000))
         beta_start = float(cfg.get("beta_start", 0.00085))
         beta_end = float(cfg.get("beta_end", 0.012))
-        # scaled_linear is the Stable Diffusion schedule.
         betas = np.linspace(np.sqrt(beta_start), np.sqrt(beta_end), n, dtype=np.float32) ** 2
         alphas = 1.0 - betas
         return np.cumprod(alphas).astype(np.float32)
@@ -91,13 +161,17 @@ class TinyDiffusion:
     @staticmethod
     def _input_name(session, candidates):
         names = [x.name for x in session.get_inputs()]
+        logger.debug("Finding input name from candidates %s in %s", candidates, names)
         for c in candidates:
             for n in names:
                 if c in n.lower():
                     return n
+        if not names:
+            raise RuntimeError("ONNX model has no inputs.")
         return names[0]
 
     def _encode(self, prompt):
+        logger.debug("Encoding prompt (length=%d)", len(prompt))
         ids = self.tokenizer(
             prompt,
             padding="max_length",
@@ -119,19 +193,27 @@ class TinyDiffusion:
                 feed[x.name] = np.array([timestep], dtype=np.float32)
             elif "encoder_hidden_states" in n or "hidden" in n:
                 feed[x.name] = hidden.astype(np.float32)
+
+        logger.debug("UNet feed keys: %s", list(feed.keys()))
+        missing = [x.name for x in inputs if x.name not in feed]
+        if missing:
+            raise RuntimeError(f"UNet input(s) not mapped: {missing}")
         return self.unet.run(None, feed)[0].astype(np.float32)
 
     def _decode(self, latents):
         name = self._input_name(self.vae, ["latent_sample", "latents", "sample"])
         scaled = (latents / 0.18215).astype(np.float32)
+        logger.debug("VAE decode input=%s shape=%s", name, scaled.shape)
         image = self.vae.run(None, {name: scaled})[0]
         image = (image / 2.0 + 0.5).clip(0, 1)
         image = (image[0].transpose(1, 2, 0) * 255).round().astype(np.uint8)
         return Image.fromarray(image, "RGB")
 
     def generate(self, prompt, width, height, steps, guidance, seed):
-        # Tiny SD is trained around 512x512. Generate at a compact latent size,
-        # then upscale to the requested final resolution to keep CPU/RAM usage low.
+        logger.info(
+            "Generation started | prompt=%r | size=%sx%s | steps=%s | guidance=%s | seed=%s",
+            prompt, width, height, steps, guidance, seed
+        )
         native_w = 512
         native_h = 512
         latent_h, latent_w = native_h // 8, native_w // 8
@@ -143,7 +225,6 @@ class TinyDiffusion:
         rng = np.random.default_rng(seed)
         latents = rng.standard_normal((1, 4, latent_h, latent_w), dtype=np.float32)
 
-        # DDIM-style deterministic stepping using the model's SD1.x beta schedule.
         timesteps = np.linspace(999, 1, steps, dtype=np.int64)
         for i, t in enumerate(timesteps):
             a_t = float(self.scheduler[t])
@@ -167,6 +248,7 @@ class TinyDiffusion:
         image = self._decode(latents)
         if (width, height) != image.size:
             image = image.resize((width, height), Image.Resampling.LANCZOS)
+        logger.info("Generation completed successfully")
         return image
 
 
@@ -213,9 +295,7 @@ class App:
         self.preview.pack(fill="both", expand=True)
 
     def set_progress(self, current, total, msg):
-        def update():
-            self.status.set(msg)
-        self.root.after(0, update)
+        self.root.after(0, lambda: self.status.set(msg))
 
     def generate(self):
         prompt = self.prompt.get("1.0", "end").strip()
@@ -230,6 +310,7 @@ class App:
             messagebox.showerror("Invalid settings", "Choose valid image settings.")
             return
 
+        logger.info("Generate button clicked")
         self.btn.config(state="disabled")
         self.status.set("Loading tiny local AI...")
         threading.Thread(
@@ -247,10 +328,13 @@ class App:
             self.image = image
             path = os.path.join(OUT_DIR, f"kyzer_{time.time_ns()}.png")
             image.save(path)
+            logger.info("Image saved: %s", path)
             self.root.after(0, lambda: self.show(image, path))
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Generation failed", str(e)))
-            self.root.after(0, lambda: self.status.set("Generation failed."))
+            log_exception("IMAGE GENERATION FAILED", e)
+            error_text = f"{type(e).__name__}: {e}\n\nFull error log saved to:\n{LOG_FILE}"
+            self.root.after(0, lambda: messagebox.showerror("Generation failed", error_text))
+            self.root.after(0, lambda: self.status.set(f"Generation failed • Log: {LOG_FILE}"))
         finally:
             self.root.after(0, lambda: self.btn.config(state="normal"))
 
@@ -271,6 +355,7 @@ class App:
         )
         if p:
             self.image.save(p)
+            logger.info("Image manually saved: %s", p)
             self.status.set("Saved: " + p)
 
 
