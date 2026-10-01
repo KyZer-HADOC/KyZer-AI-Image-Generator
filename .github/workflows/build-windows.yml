@@ -18,8 +18,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
+      - name: Create app icon
+        run: python make_icon.py
       - name: Build EXE
-        run: python -m PyInstaller --noconfirm --clean --windowed --name KyZerAI app.py
+        run: python -m PyInstaller --noconfirm --clean --windowed --icon=icon.ico --name KyZerAI app.py
       - name: Package
         shell: pwsh
         run: Compress-Archive -Path dist/KyZerAI/* -DestinationPath KyZerAI-Windows-Lite.zip
