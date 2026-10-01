@@ -6,7 +6,6 @@ import json
 import logging
 import platform
 import sys
-import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -22,7 +21,6 @@ HF_BASE = f"https://huggingface.co/{MODEL_ID}/resolve/main/"
 
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
-
 LOG_FILE = os.path.join(LOG_DIR, f"kyzer_ai_{time.strftime('%Y%m%d_%H%M%S')}.log")
 
 logging.basicConfig(
@@ -35,20 +33,14 @@ logger = logging.getLogger("KyZerAI")
 
 
 def log_exception(context, exc=None):
-    if exc is not None:
-        logger.error("%s: %s", context, exc, exc_info=True)
-    else:
-        logger.error(context, exc_info=True)
+    logger.error("%s: %s", context, exc or "", exc_info=True)
 
 
 def global_exception_handler(exc_type, exc_value, exc_traceback):
     if exc_type is KeyboardInterrupt:
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-    logger.critical(
-        "UNHANDLED APPLICATION EXCEPTION",
-        exc_info=(exc_type, exc_value, exc_traceback),
-    )
+    logger.critical("UNHANDLED APPLICATION EXCEPTION", exc_info=(exc_type, exc_value, exc_traceback))
 
 
 sys.excepthook = global_exception_handler
@@ -59,7 +51,6 @@ logger.info("Python: %s", sys.version.replace("\\n", " "))
 logger.info("Platform: %s", platform.platform())
 logger.info("Executable: %s", sys.executable)
 logger.info("App directory: %s", APP_DIR)
-
 
 MODEL_FILES = [
     "model_index.json",
@@ -98,10 +89,6 @@ def download_model(progress=None):
             progress(i, total, f"Model files: {i}/{total}")
 
 
-def model_ready():
-    return all(os.path.exists(os.path.join(MODEL_DIR, f.replace("/", os.sep))) for f in MODEL_FILES)
-
-
 class TinyDiffusion:
     def __init__(self, progress=None):
         import onnxruntime as ort
@@ -114,7 +101,6 @@ class TinyDiffusion:
 
         self.ort = ort
         self.tokenizer = CLIPTokenizer.from_pretrained(os.path.join(MODEL_DIR, "tokenizer"))
-
         self.text = self._load_session("text_encoder/model.onnx", "text_encoder")
         self.unet = self._load_session("unet/model.onnx", "unet")
         self.vae = self._load_session("vae_decoder/model.onnx", "vae_decoder")
@@ -123,29 +109,11 @@ class TinyDiffusion:
     def _load_session(self, relative_path, name):
         path = os.path.join(MODEL_DIR, relative_path.replace("/", os.sep))
         logger.info("Loading %s ONNX model: %s", name, path)
-        session_options = self.ort.SessionOptions()
-        session_options.log_severity_level = 3
-        session = self.ort.InferenceSession(
-            path,
-            sess_options=session_options,
-            providers=["CPUExecutionProvider"],
-        )
-        logger.info(
-            "%s inputs: %s",
-            name,
-            [
-                {"name": x.name, "type": x.type, "shape": x.shape}
-                for x in session.get_inputs()
-            ],
-        )
-        logger.info(
-            "%s outputs: %s",
-            name,
-            [
-                {"name": x.name, "type": x.type, "shape": x.shape}
-                for x in session.get_outputs()
-            ],
-        )
+        opts = self.ort.SessionOptions()
+        opts.log_severity_level = 3
+        session = self.ort.InferenceSession(path, sess_options=opts, providers=["CPUExecutionProvider"])
+        logger.info("%s inputs: %s", name, [{"name": x.name, "type": x.type, "shape": x.shape} for x in session.get_inputs()])
+        logger.info("%s outputs: %s", name, [{"name": x.name, "type": x.type, "shape": x.shape} for x in session.get_outputs()])
         return session
 
     def _scheduler(self):
@@ -155,13 +123,11 @@ class TinyDiffusion:
         beta_start = float(cfg.get("beta_start", 0.00085))
         beta_end = float(cfg.get("beta_end", 0.012))
         betas = np.linspace(np.sqrt(beta_start), np.sqrt(beta_end), n, dtype=np.float32) ** 2
-        alphas = 1.0 - betas
-        return np.cumprod(alphas).astype(np.float32)
+        return np.cumprod(1.0 - betas).astype(np.float32)
 
     @staticmethod
     def _input_name(session, candidates):
         names = [x.name for x in session.get_inputs()]
-        logger.debug("Finding input name from candidates %s in %s", candidates, names)
         for c in candidates:
             for n in names:
                 if c in n.lower():
@@ -172,30 +138,28 @@ class TinyDiffusion:
 
     def _encode(self, prompt):
         logger.debug("Encoding prompt (length=%d)", len(prompt))
-        ids = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="np",
-        )["input_ids"].astype(np.int64)
+        ids = self.tokenizer(prompt, padding="max_length", max_length=77, truncation=True, return_tensors="np")["input_ids"].astype(np.int64)
         name = self._input_name(self.text, ["input_ids"])
         return self.text.run(None, {name: ids})[0].astype(np.float32)
 
     def _unet(self, latents, timestep, hidden):
-        inputs = self.unet.get_inputs()
         feed = {}
-        for x in inputs:
+        for x in self.unet.get_inputs():
             n = x.name.lower()
             if "sample" in n:
                 feed[x.name] = latents.astype(np.float32)
             elif "timestep" in n:
-                feed[x.name] = np.array([timestep], dtype=np.float32)
+                # This ONNX graph declares timestep as a scalar (shape=[]).
+                # Passing [timestep] creates a [2,16] broadcast error inside /time_proj/Mul.
+                feed[x.name] = np.asarray(timestep, dtype=np.float32)
             elif "encoder_hidden_states" in n or "hidden" in n:
                 feed[x.name] = hidden.astype(np.float32)
 
-        logger.debug("UNet feed keys: %s", list(feed.keys()))
-        missing = [x.name for x in inputs if x.name not in feed]
+        logger.debug("UNet feed: %s", {
+            k: {"shape": list(v.shape), "dtype": str(v.dtype)}
+            for k, v in feed.items()
+        })
+        missing = [x.name for x in self.unet.get_inputs() if x.name not in feed]
         if missing:
             raise RuntimeError(f"UNet input(s) not mapped: {missing}")
         return self.unet.run(None, feed)[0].astype(np.float32)
@@ -210,13 +174,13 @@ class TinyDiffusion:
         return Image.fromarray(image, "RGB")
 
     def generate(self, prompt, width, height, steps, guidance, seed):
-        logger.info(
-            "Generation started | prompt=%r | size=%sx%s | steps=%s | guidance=%s | seed=%s",
-            prompt, width, height, steps, guidance, seed
-        )
-        native_w = 512
-        native_h = 512
-        latent_h, latent_w = native_h // 8, native_w // 8
+        logger.info("Generation started | prompt=%r | size=%sx%s | steps=%s | guidance=%s | seed=%s", prompt, width, height, steps, guidance, seed)
+
+        # This tiny VAE decoder is 2x spatial, so 64x64 latents produce 128x128.
+        # Keep inference small for CPU/RAM and upscale the final image.
+        native_w = 128
+        native_h = 128
+        latent_h, latent_w = native_h // 2, native_w // 2
 
         if self.progress:
             self.progress(0, steps, "Encoding prompt...")
@@ -276,11 +240,9 @@ class App:
         ttk.Label(opts, text="Width").pack(side="left")
         self.w = tk.StringVar(value="1280")
         ttk.Combobox(opts, textvariable=self.w, values=["512", "768", "1024", "1280"], width=7, state="readonly").pack(side="left", padx=5)
-
         ttk.Label(opts, text="Height").pack(side="left", padx=(15, 0))
         self.h = tk.StringVar(value="720")
         ttk.Combobox(opts, textvariable=self.h, values=["512", "576", "720", "768"], width=7, state="readonly").pack(side="left", padx=5)
-
         ttk.Label(opts, text="Steps").pack(side="left", padx=(15, 0))
         self.steps = tk.StringVar(value="15")
         ttk.Combobox(opts, textvariable=self.steps, values=["8", "10", "12", "15", "20"], width=7, state="readonly").pack(side="left", padx=5)
@@ -313,11 +275,7 @@ class App:
         logger.info("Generate button clicked")
         self.btn.config(state="disabled")
         self.status.set("Loading tiny local AI...")
-        threading.Thread(
-            target=self._generate,
-            args=(prompt, width, height, steps),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._generate, args=(prompt, width, height, steps), daemon=True).start()
 
     def _generate(self, prompt, width, height, steps):
         try:
@@ -349,10 +307,7 @@ class App:
         if self.image is None:
             messagebox.showinfo("No image", "Generate an image first.")
             return
-        p = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")],
-        )
+        p = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")])
         if p:
             self.image.save(p)
             logger.info("Image manually saved: %s", p)
