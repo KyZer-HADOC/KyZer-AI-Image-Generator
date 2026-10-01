@@ -44,13 +44,7 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
 
 
 sys.excepthook = global_exception_handler
-
-logger.info("KyZer AI started")
-logger.info("Log file: %s", LOG_FILE)
-logger.info("Python: %s", sys.version.replace("\\n", " "))
-logger.info("Platform: %s", platform.platform())
-logger.info("Executable: %s", sys.executable)
-logger.info("App directory: %s", APP_DIR)
+logger.info("KyZer AI started | Python=%s | Platform=%s | EXE=%s", sys.version.replace("\\n", " "), platform.platform(), sys.executable)
 
 MODEL_FILES = [
     "model_index.json",
@@ -75,18 +69,93 @@ def download_model(progress=None):
         dst = os.path.join(MODEL_DIR, rel.replace("/", os.sep))
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.exists(dst) and os.path.getsize(dst) > 0:
-            logger.info("Model file already exists: %s (%d bytes)", rel, os.path.getsize(dst))
-            if progress:
-                progress(i, total, f"Model files: {i}/{total}")
-            continue
-        url = HF_BASE + rel
-        tmp = dst + ".part"
-        logger.info("Downloading model file: %s", url)
-        urllib.request.urlretrieve(url, tmp)
-        os.replace(tmp, dst)
-        logger.info("Downloaded: %s (%d bytes)", rel, os.path.getsize(dst))
+            logger.info("Model exists: %s (%d bytes)", rel, os.path.getsize(dst))
+        else:
+            url = HF_BASE + rel
+            tmp = dst + ".part"
+            logger.info("Downloading: %s", url)
+            urllib.request.urlretrieve(url, tmp)
+            os.replace(tmp, dst)
+            logger.info("Downloaded: %s (%d bytes)", rel, os.path.getsize(dst))
         if progress:
-            progress(i, total, f"Model files: {i}/{total}")
+            progress(i, total, f"Model files {i}/{total}")
+
+
+class PNDMLite:
+    """Small NumPy implementation of the model's PNDMScheduler/PLMS path.
+    The model config explicitly uses PNDMScheduler with skip_prk_steps=true.
+    """
+
+    def __init__(self, config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        n = int(cfg.get("num_train_timesteps", 1000))
+        beta_start = float(cfg.get("beta_start", 0.00085))
+        beta_end = float(cfg.get("beta_end", 0.012))
+        beta_schedule = cfg.get("beta_schedule", "scaled_linear")
+        self.steps_offset = int(cfg.get("steps_offset", 1))
+        self.set_alpha_to_one = bool(cfg.get("set_alpha_to_one", False))
+        if beta_schedule == "scaled_linear":
+            betas = np.linspace(np.sqrt(beta_start), np.sqrt(beta_end), n, dtype=np.float32) ** 2
+        else:
+            betas = np.linspace(beta_start, beta_end, n, dtype=np.float32)
+        self.alphas_cumprod = np.cumprod(1.0 - betas).astype(np.float32)
+        self.final_alpha_cumprod = np.float32(1.0 if self.set_alpha_to_one else self.alphas_cumprod[0])
+        self.num_train_timesteps = n
+        self.ets = []
+        self.counter = 0
+        self.cur_sample = None
+        self.num_inference_steps = None
+        self.plms_timesteps = None
+
+    def set_timesteps(self, num_inference_steps):
+        self.num_inference_steps = num_inference_steps
+        step_ratio = self.num_train_timesteps // num_inference_steps
+        base = (np.arange(0, num_inference_steps) * step_ratio).round().astype(np.int64)
+        base += self.steps_offset
+        self.plms_timesteps = np.concatenate([base[:-1], base[-2:-1], base[-1:]])[::-1].copy()
+        self.ets = []
+        self.counter = 0
+        self.cur_sample = None
+        return self.plms_timesteps
+
+    def _get_prev_sample(self, sample, timestep, prev_timestep, model_output):
+        a_t = self.alphas_cumprod[int(timestep)]
+        a_prev = self.alphas_cumprod[int(prev_timestep)] if prev_timestep >= 0 else self.final_alpha_cumprod
+        b_t = 1.0 - a_t
+        b_prev = 1.0 - a_prev
+        sample_coeff = np.sqrt(a_prev / a_t)
+        denom = a_t * np.sqrt(b_prev) + np.sqrt(a_t * b_t * a_prev)
+        return sample_coeff * sample - ((a_prev - a_t) * model_output / max(denom, 1e-12))
+
+    def step(self, model_output, timestep, sample):
+        step_size = self.num_train_timesteps // self.num_inference_steps
+        prev_timestep = int(timestep) - step_size
+
+        if self.counter != 1:
+            self.ets = self.ets[-3:]
+            self.ets.append(model_output.copy())
+        else:
+            prev_timestep = int(timestep)
+            timestep = int(timestep) + step_size
+
+        if len(self.ets) == 1 and self.counter == 0:
+            output = model_output
+            self.cur_sample = sample.copy()
+        elif len(self.ets) == 1 and self.counter == 1:
+            output = (model_output + self.ets[-1]) / 2.0
+            sample = self.cur_sample
+            self.cur_sample = None
+        elif len(self.ets) == 2:
+            output = (3.0 * self.ets[-1] - self.ets[-2]) / 2.0
+        elif len(self.ets) == 3:
+            output = (23.0 * self.ets[-1] - 16.0 * self.ets[-2] + 5.0 * self.ets[-3]) / 12.0
+        else:
+            output = (55.0 * self.ets[-1] - 59.0 * self.ets[-2] + 37.0 * self.ets[-3] - 9.0 * self.ets[-4]) / 24.0
+
+        prev = self._get_prev_sample(sample, int(timestep), int(prev_timestep), output)
+        self.counter += 1
+        return prev.astype(np.float32)
 
 
 class TinyDiffusion:
@@ -95,8 +164,7 @@ class TinyDiffusion:
         from transformers import CLIPTokenizer
 
         self.progress = progress
-        logger.info("Loading ONNX Runtime %s", ort.__version__)
-        logger.info("Available ONNX providers: %s", ort.get_available_providers())
+        logger.info("ONNX Runtime %s | providers=%s", ort.__version__, ort.get_available_providers())
         download_model(progress)
 
         self.ort = ort
@@ -104,26 +172,18 @@ class TinyDiffusion:
         self.text = self._load_session("text_encoder/model.onnx", "text_encoder")
         self.unet = self._load_session("unet/model.onnx", "unet")
         self.vae = self._load_session("vae_decoder/model.onnx", "vae_decoder")
-        self.scheduler = self._scheduler()
+        self.scheduler = PNDMLite(os.path.join(MODEL_DIR, "scheduler", "scheduler_config.json"))
+        logger.info("PNDM scheduler loaded: skip_prk_steps=true")
 
     def _load_session(self, relative_path, name):
         path = os.path.join(MODEL_DIR, relative_path.replace("/", os.sep))
-        logger.info("Loading %s ONNX model: %s", name, path)
         opts = self.ort.SessionOptions()
         opts.log_severity_level = 3
         session = self.ort.InferenceSession(path, sess_options=opts, providers=["CPUExecutionProvider"])
-        logger.info("%s inputs: %s", name, [{"name": x.name, "type": x.type, "shape": x.shape} for x in session.get_inputs()])
-        logger.info("%s outputs: %s", name, [{"name": x.name, "type": x.type, "shape": x.shape} for x in session.get_outputs()])
+        logger.info("%s inputs=%s outputs=%s", name,
+                    [{"name": x.name, "type": x.type, "shape": x.shape} for x in session.get_inputs()],
+                    [{"name": x.name, "type": x.type, "shape": x.shape} for x in session.get_outputs()])
         return session
-
-    def _scheduler(self):
-        with open(os.path.join(MODEL_DIR, "scheduler", "scheduler_config.json"), "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        n = int(cfg.get("num_train_timesteps", 1000))
-        beta_start = float(cfg.get("beta_start", 0.00085))
-        beta_end = float(cfg.get("beta_end", 0.012))
-        betas = np.linspace(np.sqrt(beta_start), np.sqrt(beta_end), n, dtype=np.float32) ** 2
-        return np.cumprod(1.0 - betas).astype(np.float32)
 
     @staticmethod
     def _input_name(session, candidates):
@@ -137,7 +197,6 @@ class TinyDiffusion:
         return names[0]
 
     def _encode(self, prompt):
-        logger.debug("Encoding prompt (length=%d)", len(prompt))
         ids = self.tokenizer(prompt, padding="max_length", max_length=77, truncation=True, return_tensors="np")["input_ids"].astype(np.int64)
         name = self._input_name(self.text, ["input_ids"])
         return self.text.run(None, {name: ids})[0].astype(np.float32)
@@ -149,16 +208,9 @@ class TinyDiffusion:
             if "sample" in n:
                 feed[x.name] = latents.astype(np.float32)
             elif "timestep" in n:
-                # This ONNX graph declares timestep as a scalar (shape=[]).
-                # Passing [timestep] creates a [2,16] broadcast error inside /time_proj/Mul.
                 feed[x.name] = np.asarray(timestep, dtype=np.float32)
             elif "encoder_hidden_states" in n or "hidden" in n:
                 feed[x.name] = hidden.astype(np.float32)
-
-        logger.debug("UNet feed: %s", {
-            k: {"shape": list(v.shape), "dtype": str(v.dtype)}
-            for k, v in feed.items()
-        })
         missing = [x.name for x in self.unet.get_inputs() if x.name not in feed]
         if missing:
             raise RuntimeError(f"UNet input(s) not mapped: {missing}")
@@ -167,47 +219,33 @@ class TinyDiffusion:
     def _decode(self, latents):
         name = self._input_name(self.vae, ["latent_sample", "latents", "sample"])
         scaled = (latents / 0.18215).astype(np.float32)
-        logger.debug("VAE decode input=%s shape=%s", name, scaled.shape)
         image = self.vae.run(None, {name: scaled})[0]
         image = (image / 2.0 + 0.5).clip(0, 1)
         image = (image[0].transpose(1, 2, 0) * 255).round().astype(np.uint8)
         return Image.fromarray(image, "RGB")
 
     def generate(self, prompt, width, height, steps, guidance, seed):
-        logger.info("Generation started | prompt=%r | size=%sx%s | steps=%s | guidance=%s | seed=%s", prompt, width, height, steps, guidance, seed)
+        logger.info("Generation started | prompt=%r | output=%sx%s | steps=%s | seed=%s", prompt, width, height, steps, seed)
+        # Tiny SD VAE is 2x spatial: 64x64 latent -> 128x128 native image.
+        native = 128
+        latent_size = native // 2
 
-        # This tiny VAE decoder is 2x spatial, so 64x64 latents produce 128x128.
-        # Keep inference small for CPU/RAM and upscale the final image.
-        native_w = 128
-        native_h = 128
-        latent_h, latent_w = native_h // 2, native_w // 2
-
-        if self.progress:
-            self.progress(0, steps, "Encoding prompt...")
         cond = self._encode(prompt)
         uncond = self._encode("")
         rng = np.random.default_rng(seed)
-        latents = rng.standard_normal((1, 4, latent_h, latent_w), dtype=np.float32)
+        latents = rng.standard_normal((1, 4, latent_size, latent_size), dtype=np.float32)
 
-        timesteps = np.linspace(999, 1, steps, dtype=np.int64)
-        for i, t in enumerate(timesteps):
-            a_t = float(self.scheduler[t])
-            prev_t = 0 if i == steps - 1 else int(timesteps[i + 1])
-            a_prev = float(self.scheduler[prev_t])
-
+        timesteps = self.scheduler.set_timesteps(steps)
+        for i, t in enumerate(timesteps[:steps]):
             latent_in = np.concatenate([latents, latents], axis=0)
             hidden = np.concatenate([uncond, cond], axis=0)
             noise = self._unet(latent_in, int(t), hidden)
             eps_uncond, eps_cond = noise[0:1], noise[1:2]
             eps = eps_uncond + guidance * (eps_cond - eps_uncond)
-
-            pred_x0 = (latents - np.sqrt(1.0 - a_t) * eps) / np.sqrt(max(a_t, 1e-6))
-            pred_x0 = np.clip(pred_x0, -4.0, 4.0)
-            direction = np.sqrt(max(1.0 - a_prev, 0.0)) * eps
-            latents = np.sqrt(max(a_prev, 1e-6)) * pred_x0 + direction
+            latents = self.scheduler.step(eps, int(t), latents)
 
             if self.progress:
-                self.progress(i + 1, steps, f"Generating {i + 1}/{steps}...")
+                self.progress(i + 1, steps, f"Generating {i + 1}/{steps} • {int((i + 1) / steps * 100)}%")
 
         image = self._decode(latents)
         if (width, height) != image.size:
@@ -217,64 +255,154 @@ class TinyDiffusion:
 
 
 class App:
+    BG = "#0b0d12"
+    PANEL = "#11151d"
+    PANEL2 = "#171c26"
+    TEXT = "#f5f7fb"
+    MUTED = "#8f9bad"
+    ACCENT = "#ff3d71"
+    ACCENT2 = "#7c5cff"
+    BORDER = "#252c38"
+
     def __init__(self, root):
         self.root = root
-        root.title("KyZer AI Image Generator — Lite")
-        root.geometry("1050x760")
-        root.minsize(900, 650)
+        root.title("KyZer AI")
+        root.geometry("1180x780")
+        root.minsize(980, 680)
+        root.configure(bg=self.BG)
         self.image = None
         self.tkimg = None
         self.engine = None
+        self._setup_icon()
+        self._setup_style()
+        self._build_ui()
 
-        frm = ttk.Frame(root, padding=18)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="KyZer AI Image Generator", font=("Segoe UI", 22, "bold")).pack(anchor="w")
-        ttk.Label(frm, text="Ultra Lite • Local CPU AI • No API • No credits").pack(anchor="w", pady=(0, 15))
+    def _setup_icon(self):
+        try:
+            base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            icon = os.path.join(base, "icon.ico")
+            if os.path.exists(icon):
+                self.root.iconbitmap(icon)
+        except Exception as e:
+            logger.warning("Could not set application icon: %s", e)
 
-        ttk.Label(frm, text="Prompt").pack(anchor="w")
-        self.prompt = tk.Text(frm, height=5, font=("Segoe UI", 11), wrap="word")
-        self.prompt.pack(fill="x", pady=(5, 12))
+    def _setup_style(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(".", background=self.BG, foreground=self.TEXT, font=("Segoe UI", 10))
+        style.configure("TFrame", background=self.BG)
+        style.configure("Panel.TFrame", background=self.PANEL)
+        style.configure("TLabel", background=self.BG, foreground=self.TEXT)
+        style.configure("Muted.TLabel", background=self.BG, foreground=self.MUTED)
+        style.configure("Panel.TLabel", background=self.PANEL, foreground=self.TEXT)
+        style.configure("PanelMuted.TLabel", background=self.PANEL, foreground=self.MUTED)
+        style.configure("TButton", background=self.PANEL2, foreground=self.TEXT, borderwidth=0, padding=(14, 9))
+        style.map("TButton", background=[("active", self.ACCENT2)])
+        style.configure("Accent.TButton", background=self.ACCENT, foreground="white", padding=(18, 10), font=("Segoe UI", 10, "bold"))
+        style.map("Accent.TButton", background=[("active", "#ff5a86"), ("disabled", "#4d2634")])
+        style.configure("TCombobox", fieldbackground=self.PANEL2, background=self.PANEL2, foreground=self.TEXT, arrowcolor=self.TEXT, padding=6)
+        style.map("TCombobox", fieldbackground=[("readonly", self.PANEL2)], foreground=[("readonly", self.TEXT)])
+        style.configure("TProgressbar", troughcolor=self.PANEL2, background=self.ACCENT, borderwidth=0, thickness=5)
 
-        opts = ttk.Frame(frm)
-        opts.pack(fill="x")
-        ttk.Label(opts, text="Width").pack(side="left")
+    def _build_ui(self):
+        outer = tk.Frame(self.root, bg=self.BG)
+        outer.pack(fill="both", expand=True, padx=20, pady=18)
+
+        header = tk.Frame(outer, bg=self.BG)
+        header.pack(fill="x", pady=(0, 16))
+
+        logo = tk.Canvas(header, width=52, height=52, bg=self.BG, highlightthickness=0)
+        logo.pack(side="left")
+        logo.create_oval(3, 3, 49, 49, fill=self.ACCENT2, outline="")
+        logo.create_oval(8, 8, 44, 44, fill=self.ACCENT, outline="")
+        logo.create_text(26, 27, text="K", fill="white", font=("Segoe UI", 21, "bold"))
+
+        title_box = tk.Frame(header, bg=self.BG)
+        title_box.pack(side="left", padx=12)
+        tk.Label(title_box, text="KyZer AI", bg=self.BG, fg=self.TEXT, font=("Segoe UI", 23, "bold")).pack(anchor="w")
+        tk.Label(title_box, text="LOCAL IMAGE GENERATOR  •  PRIVATE  •  UNLIMITED", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w")
+
+        tk.Label(header, text="●  LOCAL CPU", bg=self.BG, fg="#69e89a", font=("Segoe UI", 9, "bold")).pack(side="right", pady=10)
+
+        content = tk.Frame(outer, bg=self.BG)
+        content.pack(fill="both", expand=True)
+
+        left = tk.Frame(content, bg=self.PANEL, width=365, highlightthickness=1, highlightbackground=self.BORDER)
+        left.pack(side="left", fill="y", padx=(0, 14))
+        left.pack_propagate(False)
+
+        tk.Label(left, text="Create an image", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=20, pady=(20, 3))
+        tk.Label(left, text="Describe what you want to see.", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(0, 14))
+
+        tk.Label(left, text="PROMPT", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=20)
+        prompt_wrap = tk.Frame(left, bg=self.PANEL2, highlightthickness=1, highlightbackground=self.BORDER)
+        prompt_wrap.pack(fill="x", padx=20, pady=(6, 15))
+        self.prompt = tk.Text(prompt_wrap, height=7, bg=self.PANEL2, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", bd=0, wrap="word", font=("Segoe UI", 10), padx=10, pady=9)
+        self.prompt.pack(fill="both", expand=True)
+
+        self._label(left, "WIDTH", 20, 0)
         self.w = tk.StringVar(value="1280")
-        ttk.Combobox(opts, textvariable=self.w, values=["512", "768", "1024", "1280"], width=7, state="readonly").pack(side="left", padx=5)
-        ttk.Label(opts, text="Height").pack(side="left", padx=(15, 0))
+        ttk.Combobox(left, textvariable=self.w, values=["512", "768", "1024", "1280"], state="readonly").pack(fill="x", padx=20, pady=(5, 10))
+
+        self._label(left, "HEIGHT", 20, 0)
         self.h = tk.StringVar(value="720")
-        ttk.Combobox(opts, textvariable=self.h, values=["512", "576", "720", "768"], width=7, state="readonly").pack(side="left", padx=5)
-        ttk.Label(opts, text="Steps").pack(side="left", padx=(15, 0))
+        ttk.Combobox(left, textvariable=self.h, values=["512", "576", "720", "768"], state="readonly").pack(fill="x", padx=20, pady=(5, 10))
+
+        self._label(left, "QUALITY / STEPS", 20, 0)
         self.steps = tk.StringVar(value="15")
-        ttk.Combobox(opts, textvariable=self.steps, values=["8", "10", "12", "15", "20"], width=7, state="readonly").pack(side="left", padx=5)
+        ttk.Combobox(left, textvariable=self.steps, values=["8", "10", "12", "15", "20"], state="readonly").pack(fill="x", padx=20, pady=(5, 16))
 
-        self.btn = ttk.Button(opts, text="GENERATE", command=self.generate)
-        self.btn.pack(side="left", padx=25)
-        ttk.Button(opts, text="SAVE IMAGE", command=self.save).pack(side="left")
+        self.btn = ttk.Button(left, text="✦  GENERATE IMAGE", style="Accent.TButton", command=self.generate)
+        self.btn.pack(fill="x", padx=20)
 
-        self.status = tk.StringVar(value="Ready • Tiny AI model is only about 9 MB.")
-        ttk.Label(frm, textvariable=self.status).pack(anchor="w", pady=10)
-        self.preview = ttk.Label(frm, text="Generated image will appear here", anchor="center")
-        self.preview.pack(fill="both", expand=True)
+        ttk.Button(left, text="SAVE CURRENT IMAGE", command=self.save).pack(fill="x", padx=20, pady=8)
+
+        self.status = tk.StringVar(value="Ready • First run downloads the tiny local model.")
+        tk.Label(left, textvariable=self.status, bg=self.PANEL, fg=self.MUTED, wraplength=320, justify="left", font=("Segoe UI", 8)).pack(anchor="w", padx=20, pady=(10, 5))
+
+        right = tk.Frame(content, bg=self.PANEL, highlightthickness=1, highlightbackground=self.BORDER)
+        right.pack(side="left", fill="both", expand=True)
+
+        top = tk.Frame(right, bg=self.PANEL)
+        top.pack(fill="x", padx=18, pady=16)
+        tk.Label(top, text="Preview", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI", 14, "bold")).pack(side="left")
+        tk.Label(top, text="AUTO-SAVED TO  Pictures / KyZer AI", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(side="right")
+
+        preview_bg = tk.Frame(right, bg="#080a0f", highlightthickness=1, highlightbackground=self.BORDER)
+        preview_bg.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+
+        self.preview = tk.Label(preview_bg, text="Your generated artwork\nwill appear here", bg="#080a0f", fg="#596273", font=("Segoe UI", 15, "bold"), justify="center")
+        self.preview.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self.progress = ttk.Progressbar(right, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", padx=18, pady=(0, 5))
+        self.progress["value"] = 0
+
+    def _label(self, parent, text, padx, pady):
+        tk.Label(parent, text=text, bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=padx, pady=(pady, 0))
 
     def set_progress(self, current, total, msg):
-        self.root.after(0, lambda: self.status.set(msg))
+        pct = int(current / max(total, 1) * 100)
+        self.root.after(0, lambda: (self.status.set(msg), self.progress.configure(value=pct)))
 
     def generate(self):
         prompt = self.prompt.get("1.0", "end").strip()
         if not prompt:
-            messagebox.showwarning("Prompt required", "Enter an image prompt.")
+            messagebox.showwarning("Prompt required", "Enter a description first.")
             return
         try:
-            width = int(self.w.get())
-            height = int(self.h.get())
-            steps = int(self.steps.get())
+            width, height, steps = int(self.w.get()), int(self.h.get()), int(self.steps.get())
         except ValueError:
             messagebox.showerror("Invalid settings", "Choose valid image settings.")
             return
 
-        logger.info("Generate button clicked")
+        logger.info("Generate clicked | prompt=%r | size=%sx%s | steps=%s", prompt, width, height, steps)
         self.btn.config(state="disabled")
-        self.status.set("Loading tiny local AI...")
+        self.progress["value"] = 0
+        self.status.set("Loading local AI...")
         threading.Thread(target=self._generate, args=(prompt, width, height, steps), daemon=True).start()
 
     def _generate(self, prompt, width, height, steps):
@@ -284,24 +412,25 @@ class App:
             seed = int(time.time_ns() & 0xFFFFFFFF)
             image = self.engine.generate(prompt, width, height, steps, 7.5, seed)
             self.image = image
-            path = os.path.join(OUT_DIR, f"kyzer_{time.time_ns()}.png")
+            path = os.path.join(OUT_DIR, f"kyzer_{time.strftime('%Y%m%d_%H%M%S')}_{seed}.png")
             image.save(path)
             logger.info("Image saved: %s", path)
             self.root.after(0, lambda: self.show(image, path))
         except Exception as e:
             log_exception("IMAGE GENERATION FAILED", e)
-            error_text = f"{type(e).__name__}: {e}\n\nFull error log saved to:\n{LOG_FILE}"
-            self.root.after(0, lambda: messagebox.showerror("Generation failed", error_text))
-            self.root.after(0, lambda: self.status.set(f"Generation failed • Log: {LOG_FILE}"))
+            text = f"{type(e).__name__}: {e}\n\nFull log:\n{LOG_FILE}"
+            self.root.after(0, lambda: messagebox.showerror("Generation failed", text))
+            self.root.after(0, lambda: self.status.set("Generation failed • check the log file."))
         finally:
             self.root.after(0, lambda: self.btn.config(state="normal"))
 
     def show(self, image, path):
         preview = image.copy()
-        preview.thumbnail((780, 500))
+        preview.thumbnail((760, 560))
         self.tkimg = ImageTk.PhotoImage(preview)
         self.preview.config(image=self.tkimg, text="")
-        self.status.set(f"Done • Saved automatically: {path}")
+        self.progress["value"] = 100
+        self.status.set(f"Done • Saved: {path}")
 
     def save(self):
         if self.image is None:
