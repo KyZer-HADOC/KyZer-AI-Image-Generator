@@ -226,9 +226,12 @@ class TinyDiffusion:
 
     def generate(self, prompt, width, height, steps, guidance, seed):
         logger.info("Generation started | prompt=%r | output=%sx%s | steps=%s | seed=%s", prompt, width, height, steps, seed)
-        # Tiny SD VAE is 2x spatial: 64x64 latent -> 128x128 native image.
+        # The tiny VAE has two down/up blocks, so its spatial factor is 4x.
+        # 32x32 latent -> 128x128 native image. A 64x64 latent is out-of-distribution
+        # for this tiny model and can collapse into colorful noise.
         native = 128
-        latent_size = native // 2
+        latent_size = native // 4
+        logger.info("Tiny pipeline geometry | native=%s | latent=%sx%s", native, latent_size, latent_size)
 
         cond = self._encode(prompt)
         uncond = self._encode("")
@@ -248,9 +251,25 @@ class TinyDiffusion:
                 self.progress(i + 1, steps, f"Generating {i + 1}/{steps} • {int((i + 1) / steps * 100)}%")
 
         image = self._decode(latents)
+
+        # Preserve the requested aspect ratio instead of stretching the
+        # tiny model's native square output.
+        target_ratio = width / max(height, 1)
+        src_ratio = image.width / max(image.height, 1)
+        if abs(target_ratio - src_ratio) > 0.01:
+            if target_ratio > src_ratio:
+                crop_h = max(1, int(image.width / target_ratio))
+                top = max(0, (image.height - crop_h) // 2)
+                image = image.crop((0, top, image.width, top + crop_h))
+            else:
+                crop_w = max(1, int(image.height * target_ratio))
+                left = max(0, (image.width - crop_w) // 2)
+                image = image.crop((left, 0, left + crop_w, image.height))
+
         if (width, height) != image.size:
             image = image.resize((width, height), Image.Resampling.LANCZOS)
-        logger.info("Generation completed successfully")
+
+        logger.info("Generation completed successfully | native=%sx%s | final=%sx%s", native, native, width, height)
         return image
 
 
@@ -267,8 +286,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("KyZer AI")
-        root.geometry("1180x780")
-        root.minsize(980, 680)
+        root.geometry("1240x820")
+        root.minsize(1040, 720)
         root.configure(bg=self.BG)
         self.image = None
         self.tkimg = None
@@ -309,72 +328,76 @@ class App:
 
     def _build_ui(self):
         outer = tk.Frame(self.root, bg=self.BG)
-        outer.pack(fill="both", expand=True, padx=20, pady=18)
+        outer.pack(fill="both", expand=True, padx=24, pady=22)
 
         header = tk.Frame(outer, bg=self.BG)
         header.pack(fill="x", pady=(0, 16))
 
-        logo = tk.Canvas(header, width=52, height=52, bg=self.BG, highlightthickness=0)
+        logo = tk.Canvas(header, width=60, height=60, bg=self.BG, highlightthickness=0)
         logo.pack(side="left")
-        logo.create_oval(3, 3, 49, 49, fill=self.ACCENT2, outline="")
-        logo.create_oval(8, 8, 44, 44, fill=self.ACCENT, outline="")
-        logo.create_text(26, 27, text="K", fill="white", font=("Segoe UI", 21, "bold"))
+        logo.create_oval(3, 3, 57, 57, fill=self.ACCENT2, outline="")
+        logo.create_oval(9, 9, 51, 51, fill=self.ACCENT, outline="")
+        logo.create_text(30, 31, text="K", fill="white", font=("Segoe UI", 24, "bold"))
+        logo.create_oval(43, 8, 50, 15, fill="#ffffff", outline="")
 
         title_box = tk.Frame(header, bg=self.BG)
-        title_box.pack(side="left", padx=12)
+        title_box.pack(side="left", padx=14)
         tk.Label(title_box, text="KyZer AI", bg=self.BG, fg=self.TEXT, font=("Segoe UI", 23, "bold")).pack(anchor="w")
         tk.Label(title_box, text="LOCAL IMAGE GENERATOR  •  PRIVATE  •  UNLIMITED", bg=self.BG, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w")
 
-        tk.Label(header, text="●  LOCAL CPU", bg=self.BG, fg="#69e89a", font=("Segoe UI", 9, "bold")).pack(side="right", pady=10)
+        status_pill = tk.Frame(header, bg="#14221b", highlightthickness=1, highlightbackground="#254b37")
+        status_pill.pack(side="right", pady=12)
+        tk.Label(status_pill, text="  ●  LOCAL CPU  ", bg="#14221b", fg="#69e89a", font=("Segoe UI", 9, "bold")).pack(padx=2, pady=6)
 
         content = tk.Frame(outer, bg=self.BG)
         content.pack(fill="both", expand=True)
 
-        left = tk.Frame(content, bg=self.PANEL, width=365, highlightthickness=1, highlightbackground=self.BORDER)
+        left = tk.Frame(content, bg=self.PANEL, width=380, highlightthickness=1, highlightbackground=self.BORDER)
         left.pack(side="left", fill="y", padx=(0, 14))
         left.pack_propagate(False)
 
-        tk.Label(left, text="Create an image", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=20, pady=(20, 3))
-        tk.Label(left, text="Describe what you want to see.", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(0, 14))
+        tk.Label(left, text="Create something amazing", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=22, pady=(22, 3))
+        tk.Label(left, text="Your prompt stays on this PC. No API • No credits • No limits.", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=22, pady=(0, 16))
 
         tk.Label(left, text="PROMPT", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=20)
         prompt_wrap = tk.Frame(left, bg=self.PANEL2, highlightthickness=1, highlightbackground=self.BORDER)
-        prompt_wrap.pack(fill="x", padx=20, pady=(6, 15))
-        self.prompt = tk.Text(prompt_wrap, height=7, bg=self.PANEL2, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", bd=0, wrap="word", font=("Segoe UI", 10), padx=10, pady=9)
+        prompt_wrap.pack(fill="x", padx=22, pady=(6, 15))
+        self.prompt = tk.Text(prompt_wrap, height=8, bg=self.PANEL2, fg=self.TEXT, insertbackground=self.TEXT, relief="flat", bd=0, wrap="word", font=("Segoe UI", 10), padx=10, pady=9)
         self.prompt.pack(fill="both", expand=True)
 
-        self._label(left, "WIDTH", 20, 0)
+        self._label(left, "WIDTH", 22, 0)
         self.w = tk.StringVar(value="1280")
-        ttk.Combobox(left, textvariable=self.w, values=["512", "768", "1024", "1280"], state="readonly").pack(fill="x", padx=20, pady=(5, 10))
+        ttk.Combobox(left, textvariable=self.w, values=["512", "768", "1024", "1280"], state="readonly").pack(fill="x", padx=22, pady=(5, 9))
 
-        self._label(left, "HEIGHT", 20, 0)
+        self._label(left, "HEIGHT", 22, 0)
         self.h = tk.StringVar(value="720")
-        ttk.Combobox(left, textvariable=self.h, values=["512", "576", "720", "768"], state="readonly").pack(fill="x", padx=20, pady=(5, 10))
+        ttk.Combobox(left, textvariable=self.h, values=["512", "576", "720", "768"], state="readonly").pack(fill="x", padx=22, pady=(5, 9))
 
-        self._label(left, "QUALITY / STEPS", 20, 0)
+        self._label(left, "QUALITY / STEPS", 22, 0)
         self.steps = tk.StringVar(value="15")
-        ttk.Combobox(left, textvariable=self.steps, values=["8", "10", "12", "15", "20"], state="readonly").pack(fill="x", padx=20, pady=(5, 16))
+        ttk.Combobox(left, textvariable=self.steps, values=["8", "10", "12", "15", "20"], state="readonly").pack(fill="x", padx=22, pady=(5, 15))
 
         self.btn = ttk.Button(left, text="✦  GENERATE IMAGE", style="Accent.TButton", command=self.generate)
-        self.btn.pack(fill="x", padx=20)
+        self.btn.pack(fill="x", padx=22, ipady=2)
 
-        ttk.Button(left, text="SAVE CURRENT IMAGE", command=self.save).pack(fill="x", padx=20, pady=8)
+        ttk.Button(left, text="SAVE CURRENT IMAGE", command=self.save).pack(fill="x", padx=22, pady=9)
 
-        self.status = tk.StringVar(value="Ready • First run downloads the tiny local model.")
-        tk.Label(left, textvariable=self.status, bg=self.PANEL, fg=self.MUTED, wraplength=320, justify="left", font=("Segoe UI", 8)).pack(anchor="w", padx=20, pady=(10, 5))
+        self.status = tk.StringVar(value="Ready • First run downloads the tiny local model (~9 MB).")
+        tk.Label(left, text="TIP  •  Keep prompts simple and concrete for this ultra-light model.", bg=self.PANEL, fg="#6f7890", wraplength=330, justify="left", font=("Segoe UI", 8)).pack(anchor="w", padx=22, pady=(5, 5))
+        tk.Label(left, textvariable=self.status, bg=self.PANEL, fg=self.MUTED, wraplength=330, justify="left", font=("Segoe UI", 8)).pack(anchor="w", padx=22, pady=(6, 8))
 
         right = tk.Frame(content, bg=self.PANEL, highlightthickness=1, highlightbackground=self.BORDER)
         right.pack(side="left", fill="both", expand=True)
 
         top = tk.Frame(right, bg=self.PANEL)
         top.pack(fill="x", padx=18, pady=16)
-        tk.Label(top, text="Preview", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI", 14, "bold")).pack(side="left")
-        tk.Label(top, text="AUTO-SAVED TO  Pictures / KyZer AI", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(side="right")
+        tk.Label(top, text="Preview", bg=self.PANEL, fg=self.TEXT, font=("Segoe UI", 15, "bold")).pack(side="left")
+        tk.Label(top, text="AUTO-SAVED  •  PICTURES / KYZER AI", bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8, "bold")).pack(side="right")
 
-        preview_bg = tk.Frame(right, bg="#080a0f", highlightthickness=1, highlightbackground=self.BORDER)
+        preview_bg = tk.Frame(right, bg="#080a0f", highlightthickness=1, highlightbackground="#2b3140")
         preview_bg.pack(fill="both", expand=True, padx=18, pady=(0, 18))
 
-        self.preview = tk.Label(preview_bg, text="Your generated artwork\nwill appear here", bg="#080a0f", fg="#596273", font=("Segoe UI", 15, "bold"), justify="center")
+        self.preview = tk.Label(preview_bg, text="✦\n\nYour generated artwork\nwill appear here", bg="#080a0f", fg="#596273", font=("Segoe UI", 15, "bold"), justify="center")
         self.preview.pack(fill="both", expand=True, padx=20, pady=20)
 
         self.progress = ttk.Progressbar(right, mode="determinate", maximum=100)
