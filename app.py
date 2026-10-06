@@ -12,9 +12,9 @@ from tkinter import ttk, messagebox, filedialog
 import numpy as np
 from PIL import Image, ImageTk
 
-MODEL_ID = "IlyasMoutawwakil/tiny-stable-diffusion-onnx"
+MODEL_ID = "ayushmaninbox/artificial-stupidity-asif"
 APP_DIR = os.path.join(os.path.expanduser("~"), ".kyzer_ai")
-MODEL_DIR = os.path.join(APP_DIR, "tiny_model")
+MODEL_DIR = os.path.join(APP_DIR, "tiny_sd_model")
 LOG_DIR = os.path.join(APP_DIR, "logs")
 OUT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "KyZer AI")
 HF_BASE = f"https://huggingface.co/{MODEL_ID}/resolve/main/"
@@ -47,18 +47,17 @@ sys.excepthook = global_exception_handler
 logger.info("KyZer AI started | Python=%s | Platform=%s | EXE=%s", sys.version.replace("\\n", " "), platform.platform(), sys.executable)
 
 MODEL_FILES = [
-    "model_index.json",
-    "scheduler/scheduler_config.json",
-    "text_encoder/config.json",
-    "text_encoder/model.onnx",
-    "tokenizer/vocab.json",
-    "tokenizer/merges.txt",
-    "tokenizer/special_tokens_map.json",
-    "tokenizer/tokenizer_config.json",
-    "unet/config.json",
-    "unet/model.onnx",
-    "vae_decoder/config.json",
-    "vae_decoder/model.onnx",
+    "tiny-sd/model_index.json",
+    "tiny-sd/scheduler/scheduler_config.json",
+    "tiny-sd/text_encoder/config.json",
+    "tiny-sd/text_encoder/model.onnx",
+    "tiny-sd/unet/config.json",
+    "tiny-sd/unet/model.onnx",
+    "tiny-sd/vae_decoder_tiny/model.onnx",
+    "vocab.json",
+    "merges.txt",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
 ]
 
 
@@ -81,81 +80,42 @@ def download_model(progress=None):
             progress(i, total, f"Model files {i}/{total}")
 
 
-class PNDMLite:
-    """Small NumPy implementation of the model's PNDMScheduler/PLMS path.
-    The model config explicitly uses PNDMScheduler with skip_prk_steps=true.
+class DDIMLite:
+    """Small NumPy DDIM sampler used with the real quantized Tiny-SD checkpoint.
+    The checkpoint metadata names DPMSolverMultistepScheduler; DDIM is used here
+    to keep the Windows build Torch-free while retaining the same SD alpha/beta
+    schedule and classifier-free guidance.
     """
 
     def __init__(self, config_path):
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        n = int(cfg.get("num_train_timesteps", 1000))
-        beta_start = float(cfg.get("beta_start", 0.00085))
-        beta_end = float(cfg.get("beta_end", 0.012))
-        beta_schedule = cfg.get("beta_schedule", "scaled_linear")
-        self.steps_offset = int(cfg.get("steps_offset", 1))
-        self.set_alpha_to_one = bool(cfg.get("set_alpha_to_one", False))
-        if beta_schedule == "scaled_linear":
-            betas = np.linspace(np.sqrt(beta_start), np.sqrt(beta_end), n, dtype=np.float32) ** 2
+        self.n = int(cfg.get("num_train_timesteps", 1000))
+        self.beta_start = float(cfg.get("beta_start", 0.00085))
+        self.beta_end = float(cfg.get("beta_end", 0.012))
+        self.beta_schedule = cfg.get("beta_schedule", "scaled_linear")
+        self.offset = int(cfg.get("steps_offset", 1))
+        if self.beta_schedule == "scaled_linear":
+            betas = np.linspace(np.sqrt(self.beta_start), np.sqrt(self.beta_end), self.n, dtype=np.float64) ** 2
         else:
-            betas = np.linspace(beta_start, beta_end, n, dtype=np.float32)
-        self.alphas_cumprod = np.cumprod(1.0 - betas).astype(np.float32)
-        self.final_alpha_cumprod = np.float32(1.0 if self.set_alpha_to_one else self.alphas_cumprod[0])
-        self.num_train_timesteps = n
-        self.ets = []
-        self.counter = 0
-        self.cur_sample = None
-        self.num_inference_steps = None
-        self.plms_timesteps = None
+            betas = np.linspace(self.beta_start, self.beta_end, self.n, dtype=np.float64)
+        self.alpha_cumprod = np.cumprod(1.0 - betas).astype(np.float32)
 
-    def set_timesteps(self, num_inference_steps):
-        self.num_inference_steps = num_inference_steps
-        step_ratio = self.num_train_timesteps // num_inference_steps
-        base = (np.arange(0, num_inference_steps) * step_ratio).round().astype(np.int64)
-        base += self.steps_offset
-        self.plms_timesteps = np.concatenate([base[:-1], base[-2:-1], base[-1:]])[::-1].copy()
-        self.ets = []
-        self.counter = 0
-        self.cur_sample = None
-        return self.plms_timesteps
+    def timesteps(self, steps):
+        ratio = self.n // steps
+        base = (np.arange(steps) * ratio).round().astype(np.int64) + self.offset
+        return base[::-1].copy()
 
-    def _get_prev_sample(self, sample, timestep, prev_timestep, model_output):
-        a_t = self.alphas_cumprod[int(timestep)]
-        a_prev = self.alphas_cumprod[int(prev_timestep)] if prev_timestep >= 0 else self.final_alpha_cumprod
-        b_t = 1.0 - a_t
-        b_prev = 1.0 - a_prev
-        sample_coeff = np.sqrt(a_prev / a_t)
-        denom = a_t * np.sqrt(b_prev) + np.sqrt(a_t * b_t * a_prev)
-        return sample_coeff * sample - ((a_prev - a_t) * model_output / max(denom, 1e-12))
-
-    def step(self, model_output, timestep, sample):
-        step_size = self.num_train_timesteps // self.num_inference_steps
-        prev_timestep = int(timestep) - step_size
-
-        if self.counter != 1:
-            self.ets = self.ets[-3:]
-            self.ets.append(model_output.copy())
-        else:
-            prev_timestep = int(timestep)
-            timestep = int(timestep) + step_size
-
-        if len(self.ets) == 1 and self.counter == 0:
-            output = model_output
-            self.cur_sample = sample.copy()
-        elif len(self.ets) == 1 and self.counter == 1:
-            output = (model_output + self.ets[-1]) / 2.0
-            sample = self.cur_sample
-            self.cur_sample = None
-        elif len(self.ets) == 2:
-            output = (3.0 * self.ets[-1] - self.ets[-2]) / 2.0
-        elif len(self.ets) == 3:
-            output = (23.0 * self.ets[-1] - 16.0 * self.ets[-2] + 5.0 * self.ets[-3]) / 12.0
-        else:
-            output = (55.0 * self.ets[-1] - 59.0 * self.ets[-2] + 37.0 * self.ets[-3] - 9.0 * self.ets[-4]) / 24.0
-
-        prev = self._get_prev_sample(sample, int(timestep), int(prev_timestep), output)
-        self.counter += 1
-        return prev.astype(np.float32)
+    def step(self, sample, eps, timestep, prev_timestep):
+        at = float(self.alpha_cumprod[int(timestep)])
+        ap = float(self.alpha_cumprod[int(prev_timestep)]) if prev_timestep >= 0 else 1.0
+        sqrt_at = np.sqrt(max(at, 1e-12))
+        sqrt_one_at = np.sqrt(max(1.0 - at, 0.0))
+        pred_x0 = (sample - sqrt_one_at * eps) / sqrt_at
+        pred_x0 = np.clip(pred_x0, -4.0, 4.0)
+        sqrt_ap = np.sqrt(max(ap, 0.0))
+        sqrt_one_ap = np.sqrt(max(1.0 - ap, 0.0))
+        return (sqrt_ap * pred_x0 + sqrt_one_ap * eps).astype(np.float32)
 
 
 class TinyDiffusion:
@@ -168,12 +128,12 @@ class TinyDiffusion:
         download_model(progress)
 
         self.ort = ort
-        self.tokenizer = CLIPTokenizer.from_pretrained(os.path.join(MODEL_DIR, "tokenizer"))
-        self.text = self._load_session("text_encoder/model.onnx", "text_encoder")
-        self.unet = self._load_session("unet/model.onnx", "unet")
-        self.vae = self._load_session("vae_decoder/model.onnx", "vae_decoder")
-        self.scheduler = PNDMLite(os.path.join(MODEL_DIR, "scheduler", "scheduler_config.json"))
-        logger.info("PNDM scheduler loaded: skip_prk_steps=true | exact PLMS timestep path")
+        self.tokenizer = CLIPTokenizer.from_pretrained(MODEL_DIR)
+        self.text = self._load_session("tiny-sd/text_encoder/model.onnx", "text_encoder")
+        self.unet = self._load_session("tiny-sd/unet/model.onnx", "unet")
+        self.vae = self._load_session("tiny-sd/vae_decoder_tiny/model.onnx", "vae_decoder_tiny")
+        self.scheduler = DDIMLite(os.path.join(MODEL_DIR, "tiny-sd", "scheduler", "scheduler_config.json"))
+        logger.info("Real Tiny-SD checkpoint loaded | DDIM-lite sampler | guidance enabled | TAESD decoder scaling=1.0")
 
     def _load_session(self, relative_path, name):
         path = os.path.join(MODEL_DIR, relative_path.replace("/", os.sep))
@@ -197,9 +157,21 @@ class TinyDiffusion:
         return names[0]
 
     def _encode(self, prompt):
-        ids = self.tokenizer(prompt, padding="max_length", max_length=77, truncation=True, return_tensors="np")["input_ids"].astype(np.int64)
-        name = self._input_name(self.text, ["input_ids"])
-        return self.text.run(None, {name: ids})[0].astype(np.float32)
+        tok = self.tokenizer(
+            prompt, padding="max_length", max_length=77, truncation=True,
+            return_tensors="np", return_attention_mask=True,
+        )
+        feed = {}
+        for x in self.text.get_inputs():
+            n = x.name.lower()
+            if "input_ids" in n:
+                feed[x.name] = tok["input_ids"].astype(np.int64)
+            elif "attention_mask" in n and "attention_mask" in tok:
+                feed[x.name] = tok["attention_mask"].astype(np.int64)
+        missing = [x.name for x in self.text.get_inputs() if x.name not in feed]
+        if missing:
+            raise RuntimeError(f"Text encoder input(s) not mapped: {missing}")
+        return self.text.run(None, feed)[0].astype(np.float32)
 
     def _unet(self, latents, timestep, hidden):
         feed = {}
@@ -218,49 +190,46 @@ class TinyDiffusion:
 
     def _decode(self, latents):
         name = self._input_name(self.vae, ["latent_sample", "latents", "sample"])
-        scaled = (latents / 0.18215).astype(np.float32)
-        image = self.vae.run(None, {name: scaled})[0]
+        # IMPORTANT: this checkpoint uses TAESD. Its latent scaling_factor is 1.0.
+        # Dividing by SD's 0.18215 here produces the psychedelic/noise failure.
+        image = self.vae.run(None, {name: latents.astype(np.float32)})[0]
         image = (image / 2.0 + 0.5).clip(0, 1)
         image = (image[0].transpose(1, 2, 0) * 255).round().astype(np.uint8)
         return Image.fromarray(image, "RGB")
 
     def generate(self, prompt, width, height, steps, guidance, seed):
-        logger.info("Generation started | prompt=%r | output=%sx%s | steps=%s | seed=%s", prompt, width, height, steps, seed)
-        # This ONNX export's UNet is configured for a 64x64 latent grid.
-        # With the VAE's 4x spatial factor, that corresponds to 256x256
-        # native images. This matches the tiny Stable Diffusion pipeline's
-        # training/export geometry.
-        latent_size = 64
-        native = latent_size * 4
-        logger.info("Tiny pipeline geometry | native=%s | latent=%sx%s", native, latent_size, latent_size)
+        logger.info("Generation started | REAL Tiny-SD | prompt=%r | output=%sx%s | steps=%s | guidance=%s | seed=%s",
+                    prompt, width, height, steps, guidance, seed)
 
+        # Real Tiny-SD is a pruned SD 1.5 checkpoint: 64x64 latent -> 512x512 TAESD output.
+        latent_size = 64
+        native = 512
         cond = self._encode(prompt)
         uncond = self._encode("")
+        logger.info("Embeddings | cond=%s | uncond=%s", cond.shape, uncond.shape)
+
         rng = np.random.default_rng(seed)
         latents = rng.standard_normal((1, 4, latent_size, latent_size), dtype=np.float32)
+        ts = self.scheduler.timesteps(steps)
+        logger.info("DDIM timesteps=%s", ts.tolist())
 
-        timesteps = self.scheduler.set_timesteps(steps)
-        # PNDM/PLMS intentionally returns steps + 1 timesteps because one
-        # timestep is repeated to bootstrap the linear multistep method.
-        # Do NOT truncate it to "steps" or the final denoising update is lost.
-        total_calls = len(timesteps)
-        for i, t in enumerate(timesteps):
+        for i, t in enumerate(ts):
+            prev_t = int(ts[i + 1]) if i + 1 < len(ts) else -1
+
             latent_in = np.concatenate([latents, latents], axis=0)
             hidden = np.concatenate([uncond, cond], axis=0)
             noise = self._unet(latent_in, int(t), hidden)
-            eps_uncond, eps_cond = noise[0:1], noise[1:2]
-            eps = eps_uncond + guidance * (eps_cond - eps_uncond)
-            latents = self.scheduler.step(eps, int(t), latents)
+            eps_u, eps_c = noise[0:1], noise[1:2]
+            eps = eps_u + guidance * (eps_c - eps_u)
+            latents = self.scheduler.step(latents, eps, int(t), prev_t)
 
             if self.progress:
-                pct = int((i + 1) / max(total_calls, 1) * 100)
-                display_step = min(i + 1, steps)
-                self.progress(i + 1, total_calls, f"Generating {display_step}/{steps} • {pct}%")
+                pct = int((i + 1) / max(len(ts), 1) * 100)
+                self.progress(i + 1, len(ts), f"Generating {i + 1}/{len(ts)} • {pct}%")
 
         image = self._decode(latents)
 
-        # Preserve the requested aspect ratio instead of stretching the
-        # tiny model's native square output.
+        # Generate square natively, then crop + upscale to the requested output.
         target_ratio = width / max(height, 1)
         src_ratio = image.width / max(image.height, 1)
         if abs(target_ratio - src_ratio) > 0.01:
@@ -276,9 +245,10 @@ class TinyDiffusion:
         if (width, height) != image.size:
             image = image.resize((width, height), Image.Resampling.LANCZOS)
 
-        logger.info("Generation completed successfully | native=%sx%s | latent=%sx%s | final=%sx%s",
+        logger.info("Generation completed | native=%sx%s | latent=%sx%s | final=%sx%s",
                     native, native, latent_size, latent_size, width, height)
         return image
+
 
 
 class App:
@@ -382,16 +352,16 @@ class App:
         ttk.Combobox(left, textvariable=self.h, values=["512", "576", "720", "768"], state="readonly").pack(fill="x", padx=22, pady=(5, 9))
 
         self._label(left, "QUALITY / STEPS", 22, 0)
-        self.steps = tk.StringVar(value="15")
-        ttk.Combobox(left, textvariable=self.steps, values=["8", "10", "12", "15", "20"], state="readonly").pack(fill="x", padx=22, pady=(5, 15))
+        self.steps = tk.StringVar(value="16")
+        ttk.Combobox(left, textvariable=self.steps, values=["8", "12", "16", "20", "24"], state="readonly").pack(fill="x", padx=22, pady=(5, 15))
 
         self.btn = ttk.Button(left, text="✦  GENERATE IMAGE", style="Accent.TButton", command=self.generate)
         self.btn.pack(fill="x", padx=22, ipady=2)
 
         ttk.Button(left, text="SAVE CURRENT IMAGE", command=self.save).pack(fill="x", padx=22, pady=9)
 
-        self.status = tk.StringVar(value="Ready • First run downloads the tiny local model (~9 MB).")
-        tk.Label(left, text="TIP  •  Keep prompts simple and concrete for this ultra-light model.", bg=self.PANEL, fg="#6f7890", wraplength=330, justify="left", font=("Segoe UI", 8)).pack(anchor="w", padx=22, pady=(5, 5))
+        self.status = tk.StringVar(value="Ready • First run downloads the real quantized Tiny-SD model (~650 MB).")
+        tk.Label(left, text="TIP  •  Real Tiny-SD model • first download ~650 MB • CPU generation is slower but produces real semantic images.", bg=self.PANEL, fg="#6f7890", wraplength=330, justify="left", font=("Segoe UI", 8)).pack(anchor="w", padx=22, pady=(5, 5))
         tk.Label(left, textvariable=self.status, bg=self.PANEL, fg=self.MUTED, wraplength=330, justify="left", font=("Segoe UI", 8)).pack(anchor="w", padx=22, pady=(6, 8))
 
         right = tk.Frame(content, bg=self.PANEL, highlightthickness=1, highlightbackground=self.BORDER)
