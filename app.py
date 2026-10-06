@@ -173,7 +173,7 @@ class TinyDiffusion:
         self.unet = self._load_session("unet/model.onnx", "unet")
         self.vae = self._load_session("vae_decoder/model.onnx", "vae_decoder")
         self.scheduler = PNDMLite(os.path.join(MODEL_DIR, "scheduler", "scheduler_config.json"))
-        logger.info("PNDM scheduler loaded: skip_prk_steps=true")
+        logger.info("PNDM scheduler loaded: skip_prk_steps=true | exact PLMS timestep path")
 
     def _load_session(self, relative_path, name):
         path = os.path.join(MODEL_DIR, relative_path.replace("/", os.sep))
@@ -226,11 +226,12 @@ class TinyDiffusion:
 
     def generate(self, prompt, width, height, steps, guidance, seed):
         logger.info("Generation started | prompt=%r | output=%sx%s | steps=%s | seed=%s", prompt, width, height, steps, seed)
-        # The tiny VAE has two down/up blocks, so its spatial factor is 4x.
-        # 32x32 latent -> 128x128 native image. A 64x64 latent is out-of-distribution
-        # for this tiny model and can collapse into colorful noise.
-        native = 128
-        latent_size = native // 4
+        # This ONNX export's UNet is configured for a 64x64 latent grid.
+        # With the VAE's 4x spatial factor, that corresponds to 256x256
+        # native images. This matches the tiny Stable Diffusion pipeline's
+        # training/export geometry.
+        latent_size = 64
+        native = latent_size * 4
         logger.info("Tiny pipeline geometry | native=%s | latent=%sx%s", native, latent_size, latent_size)
 
         cond = self._encode(prompt)
@@ -239,7 +240,11 @@ class TinyDiffusion:
         latents = rng.standard_normal((1, 4, latent_size, latent_size), dtype=np.float32)
 
         timesteps = self.scheduler.set_timesteps(steps)
-        for i, t in enumerate(timesteps[:steps]):
+        # PNDM/PLMS intentionally returns steps + 1 timesteps because one
+        # timestep is repeated to bootstrap the linear multistep method.
+        # Do NOT truncate it to "steps" or the final denoising update is lost.
+        total_calls = len(timesteps)
+        for i, t in enumerate(timesteps):
             latent_in = np.concatenate([latents, latents], axis=0)
             hidden = np.concatenate([uncond, cond], axis=0)
             noise = self._unet(latent_in, int(t), hidden)
@@ -248,7 +253,9 @@ class TinyDiffusion:
             latents = self.scheduler.step(eps, int(t), latents)
 
             if self.progress:
-                self.progress(i + 1, steps, f"Generating {i + 1}/{steps} • {int((i + 1) / steps * 100)}%")
+                pct = int((i + 1) / max(total_calls, 1) * 100)
+                display_step = min(i + 1, steps)
+                self.progress(i + 1, total_calls, f"Generating {display_step}/{steps} • {pct}%")
 
         image = self._decode(latents)
 
@@ -269,7 +276,8 @@ class TinyDiffusion:
         if (width, height) != image.size:
             image = image.resize((width, height), Image.Resampling.LANCZOS)
 
-        logger.info("Generation completed successfully | native=%sx%s | final=%sx%s", native, native, width, height)
+        logger.info("Generation completed successfully | native=%sx%s | latent=%sx%s | final=%sx%s",
+                    native, native, latent_size, latent_size, width, height)
         return image
 
 
